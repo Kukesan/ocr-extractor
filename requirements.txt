@@ -4,6 +4,7 @@ docling>=2.15.0
 paddleocr>=2.8.1,<3.0.0
 paddlepaddle
 python-multipart
+mangum
 boto3
 supabase
 python-dotenv

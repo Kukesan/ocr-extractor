@@ -1,0 +1,29 @@
+# Lambda container image for the FastAPI /extract endpoint (app/main.py),
+# invoked through API Gateway via the Mangum adapter in app/lambda_handler.py.
+# Build/push with the standard ECR flow, then point a Lambda function
+# (package type: Image) at the pushed image.
+FROM public.ecr.aws/lambda/python:3.12
+
+# AL2023 equivalents of the Debian libgl1/libglib2.0-0/libgomp1 packages
+# docling/paddleocr need at import time.
+RUN dnf install -y \
+        mesa-libGL \
+        glib2 \
+        libgomp && \
+    dnf clean all
+
+COPY requirements.txt .
+
+# CPU-only PyTorch first, same as the worker image.
+RUN pip install --no-cache-dir \
+    torch torchvision \
+    --index-url https://download.pytorch.org/whl/cpu \
+    --target "${LAMBDA_TASK_ROOT}"
+
+RUN pip install --no-cache-dir \
+    -r requirements.txt \
+    --target "${LAMBDA_TASK_ROOT}"
+
+COPY app ${LAMBDA_TASK_ROOT}/app
+
+CMD ["app.lambda_handler.handler"]
