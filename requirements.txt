@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+docling>=2.15.0
+paddleocr>=2.8.1,<3.0.0
+paddlepaddle
+python-multipart
+boto3
+supabase
+python-dotenv
