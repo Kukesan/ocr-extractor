@@ -99,7 +99,11 @@ S3 event JSON with a top-level `Records` array). For each record it:
 3. Runs it through the same `OCRService` used by `/extract` (in-process, no HTTP call).
 4. Updates the `medical_documents` row where `id = {documentId}`:
    `processing_status = "extracted"`, `ocr_text = <extracted text>`.
-5. Deletes the SQS message on success. On failure, the row is set to
+5. Calls `POST {BACKEND_API_URL}/api/v1/documents/{documentId}/extract` with header
+   `X-API-Key: {INTERNAL_SERVICE_API_KEY}` to kick off field-extraction on the backend.
+   This call is best-effort: a failure here is logged but does not fail the SQS
+   message, since OCR already succeeded and `ocr_text` is already persisted.
+6. Deletes the SQS message on success. On failure, the row is set to
    `processing_status = "failed"`, the exception is logged, and the message is left
    on the queue to retry (route a redrive policy / DLQ at the queue level for
    poison messages).
@@ -124,6 +128,8 @@ docker run \
   -e SQS_QUEUE_URL=... \
   -e SUPABASE_URL=... \
   -e SUPABASE_SERVICE_ROLE_KEY=... \
+  -e BACKEND_API_URL=... \
+  -e INTERNAL_SERVICE_API_KEY=... \
   ocr-extraction-service python -m app.worker
 ```
 
@@ -135,6 +141,8 @@ Required environment variables:
 | `SQS_QUEUE_URL` | Queue URL to poll |
 | `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_SERVICE_ROLE_KEY` | Service-role key (bypasses RLS) used to update `medical_documents` |
+| `BACKEND_API_URL` | Base URL of the backend service (e.g. `https://api.example.com`); if unset, the post-extraction notification is skipped with a warning |
+| `INTERNAL_SERVICE_API_KEY` | Shared secret sent as `X-API-Key` when calling the backend's extract endpoint |
 
 AWS credentials are picked up from the default boto3 chain (e.g. the ECS task role) —
 no AWS keys are read from env vars directly.

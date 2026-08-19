@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 
 import boto3
+import httpx
 from dotenv import load_dotenv
 from supabase import Client, create_client
 
@@ -27,6 +28,10 @@ SQS_QUEUE_URL = os.environ["SQS_QUEUE_URL"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
+# Backend that owns field-extraction; notified after ocr_text lands in Supabase.
+BACKEND_API_URL = os.environ.get("BACKEND_API_URL", "").rstrip("/")
+INTERNAL_SERVICE_API_KEY = os.environ.get("INTERNAL_SERVICE_API_KEY", "")
+
 # Long enough for docling/PaddleOCR to finish on a large PDF before the
 # message becomes visible again to another consumer.
 VISIBILITY_TIMEOUT_SECONDS = 600
@@ -35,6 +40,31 @@ POLL_WAIT_TIME_SECONDS = 20
 sqs = boto3.client("sqs", region_name=AWS_REGION)
 s3 = boto3.client("s3", region_name=AWS_REGION)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+
+async def _notify_backend_extraction(document_id: str) -> None:
+    """Best-effort call into the backend to kick off field-extraction now that
+    ocr_text is in Supabase. Failures here don't fail the SQS message — OCR
+    already succeeded and is already persisted."""
+    if not BACKEND_API_URL:
+        logger.warning(
+            "BACKEND_API_URL not set; skipping extract notification for document %s",
+            document_id,
+        )
+        return
+
+    url = f"{BACKEND_API_URL}/api/v1/documents/{document_id}/extract"
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                url, headers={"X-API-Key": INTERNAL_SERVICE_API_KEY}
+            )
+            response.raise_for_status()
+        logger.info("Notified backend to extract fields for document %s", document_id)
+    except httpx.HTTPError:
+        logger.exception(
+            "Failed to notify backend extract endpoint for document %s", document_id
+        )
 
 
 def _document_id_from_key(key: str) -> str | None:
@@ -80,8 +110,9 @@ async def _process_record(record: dict) -> None:
 
         supabase.table("medical_documents").update(
             {
-                "processing_status": "extracted",
+                "processing_status": "ocr_completed",
                 "ocr_text": result["text"],
+                "ocr_metadata": result["metadata"]
             }
         ).eq("id", document_id).execute()
 
@@ -91,6 +122,8 @@ async def _process_record(record: dict) -> None:
             len(result["text"]),
             result["metadata"]["engine"],
         )
+
+        await _notify_backend_extraction(document_id)
     except Exception:
         logger.exception("Failed to process s3://%s/%s (document %s)", bucket, key, document_id)
         supabase.table("medical_documents").update(

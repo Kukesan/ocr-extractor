@@ -8,3 +8,4 @@ mangum
 boto3
 supabase
 python-dotenv
+httpx
