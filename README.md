@@ -54,7 +54,23 @@ result objects. This code targets the v2 API
 `paddleocr>=2.8.1,<3.0.0`. Don't relax that upper bound without updating
 `_run_paddleocr` in `app/ocr_service.py` to match the v3 API. `paddlepaddle` (the
 actual inference engine) is also a required — but not automatically pulled in —
-dependency of `paddleocr`, so it's listed explicitly.
+dependency of `paddleocr`, so it's listed explicitly, and is itself pinned to
+`<3.0.0`: PaddlePaddle 3.x's oneDNN/PIR execution backend has known regressions
+running the legacy v2-exported inference models PaddleOCR 2.x ships, which
+surfaces as `OneDnnContext does not have the input Filter` / `fused_conv2d`
+errors at inference time — pip installing an unpinned, latest `paddlepaddle`
+alongside the pinned `paddleocr<3.0.0` reproduces this.
+
+### Why docling has `torch.compile()` disabled
+
+`app/ocr_service.py` sets `DOCLING_INFERENCE_COMPILE_TORCH_MODELS=false` before
+importing docling. By default docling's object-detection layout model calls
+`torch.compile()`, which needs a C/C++ compiler (`cl.exe` on Windows, `gcc`/`g++`
+on Linux) to JIT the CPU kernels. Neither runtime image installs one (only
+`libgl1`/`libglib2.0-0`/`libgomp1`, needed for OpenCV), so left at its default this
+fails with `InvalidCxxCompiler: Compiler ... is not found` and docling falls
+through to the PaddleOCR fallback (or, if that also fails, to `engine="none"`
+with empty text).
 
 ## Running locally
 
@@ -76,8 +92,9 @@ docker run -p 8080:8080 ocr-extraction-service
 (bucket → SQS, or bucket → SNS → SQS as long as the message body is the standard
 S3 event JSON with a top-level `Records` array). For each record it:
 
-1. Parses the document id out of the object key, expected in the form
-   `documents/{userId}/{documentId}/{filename}`.
+1. Parses the document id out of the object key, expected in one of two forms:
+   `documents/{userId}/{documentId}/{filename}` or
+   `documents/{userId}/{documentId}.{ext}` (document id as the filename stem).
 2. Downloads the object from S3 to a temp file.
 3. Runs it through the same `OCRService` used by `/extract` (in-process, no HTTP call).
 4. Updates the `medical_documents` row where `id = {documentId}`:

@@ -2,6 +2,13 @@ from pathlib import Path
 
 import asyncio
 import logging
+import os
+
+# Must be set before importing docling: it reads this once at import time via
+# pydantic-settings. Without it, docling's object-detection layout model calls
+# torch.compile() by default, which needs a C/C++ compiler (cl.exe / gcc) that
+# isn't installed in the runtime image and fails with InvalidCxxCompiler.
+os.environ.setdefault("DOCLING_INFERENCE_COMPILE_TORCH_MODELS", "false")
 
 from docling.document_converter import DocumentConverter
 from paddleocr import PaddleOCR

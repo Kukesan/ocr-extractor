@@ -38,11 +38,16 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
 def _document_id_from_key(key: str) -> str | None:
-    # documents/{userId}/{documentId}/{filename}
+    # Accepts either documents/{userId}/{documentId}/{filename}
+    # or documents/{userId}/{documentId}.{ext} (documentId as the filename stem).
     parts = key.split("/")
-    if len(parts) < 4 or parts[0] != "documents":
+    if parts[0] != "documents":
         return None
-    return parts[2]
+    if len(parts) == 4:
+        return parts[2]
+    if len(parts) == 3:
+        return Path(parts[2]).stem
+    return None
 
 
 async def _process_record(record: dict) -> None:
@@ -61,6 +66,17 @@ async def _process_record(record: dict) -> None:
     try:
         await asyncio.to_thread(s3.download_file, bucket, key, str(tmp_path))
         result = await get_ocr_service().extract_text(tmp_path)
+
+        if not result["text"]:
+            logger.error(
+                "OCR produced no text for document %s (engine=%s); marking failed",
+                document_id,
+                result["metadata"]["engine"],
+            )
+            supabase.table("medical_documents").update(
+                {"processing_status": "failed"}
+            ).eq("id", document_id).execute()
+            return
 
         supabase.table("medical_documents").update(
             {
