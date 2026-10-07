@@ -3,6 +3,10 @@ downloads the object, OCRs it, and writes the result into Supabase.
 
 Runs as its own long-lived process/container (see README), separate from the
 FastAPI app in app/main.py. Started with `python -m app.worker`.
+
+The per-message processing (`handle_message_body`) is also used by the
+SQS-triggered Lambda entrypoint in app/sqs_lambda_handler.py, where Lambda
+does the polling/deleting instead of `run()`.
 """
 import asyncio
 import json
@@ -24,7 +28,9 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
 AWS_REGION = os.environ["AWS_REGION"]
-SQS_QUEUE_URL = os.environ["SQS_QUEUE_URL"]
+# Only needed by the long-polling run() loop; on Lambda the event source
+# mapping owns the queue, so this is unset there.
+SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL", "")
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
@@ -134,12 +140,12 @@ async def _process_record(record: dict) -> None:
         tmp_path.unlink(missing_ok=True)
 
 
-async def _handle_message(message: dict) -> bool:
+async def handle_message_body(raw_body: str | None) -> bool:
     """Returns True if the message should be deleted from the queue."""
     try:
-        body = json.loads(message["Body"])
-    except (KeyError, json.JSONDecodeError):
-        logger.exception("Malformed SQS message body, dropping: %s", message.get("Body"))
+        body = json.loads(raw_body)
+    except (TypeError, json.JSONDecodeError):
+        logger.exception("Malformed SQS message body, dropping: %s", raw_body)
         return True
 
     records = [r for r in body.get("Records", []) if "s3" in r]
@@ -159,6 +165,8 @@ async def _handle_message(message: dict) -> bool:
 
 
 async def run() -> None:
+    if not SQS_QUEUE_URL:
+        raise RuntimeError("SQS_QUEUE_URL must be set to run the polling worker")
     logger.info("Worker started, polling %s", SQS_QUEUE_URL)
     while True:
         response = await asyncio.to_thread(
@@ -169,7 +177,7 @@ async def run() -> None:
             VisibilityTimeout=VISIBILITY_TIMEOUT_SECONDS,
         )
         for message in response.get("Messages", []):
-            if await _handle_message(message):
+            if await handle_message_body(message.get("Body")):
                 await asyncio.to_thread(
                     sqs.delete_message,
                     QueueUrl=SQS_QUEUE_URL,

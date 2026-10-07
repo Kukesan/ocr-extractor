@@ -1,7 +1,12 @@
-# Lambda container image for the FastAPI /extract endpoint (app/main.py),
-# invoked through API Gateway via the Mangum adapter in app/lambda_handler.py.
-# Build/push with the standard ECR flow, then point a Lambda function
-# (package type: Image) at the pushed image.
+# syntax=docker/dockerfile:1
+# Lambda container image for the SQS-triggered OCR worker
+# (app/sqs_lambda_handler.py). Build for linux/amd64 and push to ECR, then
+# point a Lambda function (package type: Image) at it and add the SQS queue
+# as an event source; see "Deploying to AWS Lambda (SQS trigger)" in README.
+#
+# The image also contains the API Gateway entrypoint for the FastAPI app;
+# select it with a Lambda ImageConfig command override of
+# app.lambda_handler.handler.
 FROM public.ecr.aws/lambda/python:3.12
 
 # AL2023 equivalents of the Debian libgl1/libglib2.0-0/libgomp1 packages
@@ -12,18 +17,39 @@ RUN dnf install -y \
         libgomp && \
     dnf clean all
 
+# Lambda's filesystem is read-only outside /tmp, so the OCR models that
+# docling/PaddleOCR/EasyOCR would normally download into ~ on first use are
+# baked into this directory at build time instead (see prefetch step below).
+ENV HOME=/opt/ocr-home \
+    HF_HOME=/opt/ocr-home/.cache/huggingface \
+    TORCH_HOME=/opt/ocr-home/.cache/torch \
+    MPLCONFIGDIR=/tmp/matplotlib
+
 COPY requirements.txt .
 
-# CPU-only PyTorch first, same as the worker image.
-RUN pip install --no-cache-dir \
-    torch torchvision \
-    --index-url https://download.pytorch.org/whl/cpu \
-    --target "${LAMBDA_TASK_ROOT}"
+COPY --from=ghcr.io/astral-sh/uv:0.12 /uv /usr/local/bin/uv
 
-RUN pip install --no-cache-dir \
-    -r requirements.txt \
+# CPU-only PyTorch plus the app dependencies in one uv resolve, same as the
+# worker image (see the Dockerfile for why unsafe-best-match). The uv cache
+# is a BuildKit cache mount, reused across builds but kept out of the image.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    UV_LINK_MODE=copy uv pip install \
+    -r requirements.txt torch torchvision \
+    --extra-index-url https://download.pytorch.org/whl/cpu \
+    --index-strategy unsafe-best-match \
     --target "${LAMBDA_TASK_ROOT}"
 
 COPY app ${LAMBDA_TASK_ROOT}/app
 
-CMD ["app.lambda_handler.handler"]
+# Run both engines once so all their models are downloaded into the image,
+# then make everything readable by the non-root user Lambda runs as.
+RUN mkdir -p "${HOME}" && \
+    cd "${LAMBDA_TASK_ROOT}" && \
+    python -m app.prefetch_models && \
+    chmod -R a+rX "${HOME}" "${LAMBDA_TASK_ROOT}"
+
+# From here on, never try to reach the Hugging Face Hub: models are local
+# and the cache directory is read-only at runtime.
+ENV HF_HUB_OFFLINE=1
+
+CMD ["app.sqs_lambda_handler.handler"]

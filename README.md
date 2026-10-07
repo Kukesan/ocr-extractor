@@ -98,7 +98,8 @@ S3 event JSON with a top-level `Records` array). For each record it:
 2. Downloads the object from S3 to a temp file.
 3. Runs it through the same `OCRService` used by `/extract` (in-process, no HTTP call).
 4. Updates the `medical_documents` row where `id = {documentId}`:
-   `processing_status = "extracted"`, `ocr_text = <extracted text>`.
+   `processing_status = "ocr_completed"`, `ocr_text = <extracted text>`,
+   `ocr_metadata = <engine/confidence metadata>`.
 5. Calls `POST {BACKEND_API_URL}/api/v1/documents/{documentId}/extract` with header
    `X-API-Key: {INTERNAL_SERVICE_API_KEY}` to kick off field-extraction on the backend.
    This call is best-effort: a failure here is logged but does not fail the SQS
@@ -150,6 +151,133 @@ no AWS keys are read from env vars directly.
 On ECS/Fargate, run this as its own service (or task definition command override
 pointing at the same image), separate from the HTTP API service, since it's a
 long-running poller rather than a request handler.
+
+## Deploying to AWS Lambda (SQS trigger)
+
+`Dockerfile.lambda` builds a Lambda container image whose entrypoint is
+`app.sqs_lambda_handler.handler`. Lambda polls the queue itself through an event
+source mapping and calls the handler with batches of messages. Each message goes
+through the same `handle_message_body` the polling worker uses. The handler returns
+a partial batch response (`batchItemFailures`), so only failed messages go back on
+the queue. Lambda deletes the successful ones.
+
+The image bakes all OCR models in at build time (`python -m app.prefetch_models`),
+because Lambda's filesystem is read-only outside `/tmp` and the engines would
+otherwise try to download models into `~` on first use. If either engine fails
+during that step, the build fails.
+
+### 1. Build and push to ECR
+
+Lambda only accepts single-platform Docker v2 manifests, so build for
+`linux/amd64` with provenance attestations disabled:
+
+```bash
+AWS_REGION=ap-south-1
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+REPO=ocr-extractor
+IMAGE_URI=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO:latest
+
+aws ecr create-repository --repository-name $REPO --region $AWS_REGION  # first time only
+aws ecr get-login-password --region $AWS_REGION \
+  | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+docker build --platform linux/amd64 --provenance=false -f Dockerfile.lambda -t $IMAGE_URI .
+docker push $IMAGE_URI
+```
+
+### 2. Execution role
+
+Create a role that `lambda.amazonaws.com` can assume. Attach the managed policy
+`AWSLambdaBasicExecutionRole` (for CloudWatch Logs), plus:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
+      "Resource": "arn:aws:sqs:<region>:<account-id>:<queue-name>"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::<bucket-name>/documents/*"
+    }
+  ]
+}
+```
+
+If the queue uses a customer-managed KMS key, the role also needs `kms:Decrypt` on that key.
+
+### 3. Create the function
+
+```bash
+aws lambda create-function \
+  --function-name ocr-extractor \
+  --package-type Image \
+  --code ImageUri=$IMAGE_URI \
+  --role arn:aws:iam::$ACCOUNT_ID:role/<ocr-extractor-role> \
+  --architectures x86_64 \
+  --memory-size 10240 \
+  --timeout 900 \
+  --ephemeral-storage Size=2048 \
+  --environment "Variables={SUPABASE_URL=...,SUPABASE_SERVICE_ROLE_KEY=...,BACKEND_API_URL=...,INTERNAL_SERVICE_API_KEY=...,LOG_LEVEL=INFO}" \
+  --region $AWS_REGION
+```
+
+- **Memory**: Lambda allocates CPU in proportion to memory. At 10240 MB you get
+  6 vCPU, and docling/PaddleOCR are CPU-bound, so lower memory means much slower
+  OCR. 6144 MB should be the lowest you try.
+- **Timeout**: 900 s (15 min) is the Lambda maximum. A document that takes longer
+  than that to OCR can't be processed on Lambda.
+- **Ephemeral storage**: `/tmp` holds the downloaded document. Raise the 512 MB
+  default if you expect large PDFs.
+- Don't set `AWS_REGION` (Lambda sets it) or AWS access keys (the execution role
+  provides credentials). `SQS_QUEUE_URL` isn't needed either, because the event
+  source mapping owns the queue.
+- Cold starts are slow. The first invocation in a new execution environment imports
+  torch/docling and loads the models, which can take tens of seconds. Warm
+  invocations reuse the loaded engines.
+
+To ship a new image later:
+
+```bash
+aws lambda update-function-code --function-name ocr-extractor --image-uri $IMAGE_URI
+```
+
+### 4. Configure the queue and connect it
+
+On the SQS queue:
+
+- Set the **visibility timeout to at least 6× the function timeout** (5400 s for a
+  900 s timeout). AWS recommends this so a message doesn't reappear while Lambda is
+  still retrying or throttled.
+- Add a **dead-letter queue** with a redrive `maxReceiveCount` (e.g. 3). Without one,
+  a document that keeps failing OCR is retried until the message expires.
+
+Then create the event source mapping:
+
+```bash
+aws lambda create-event-source-mapping \
+  --function-name ocr-extractor \
+  --event-source-arn arn:aws:sqs:$AWS_REGION:$ACCOUNT_ID:<queue-name> \
+  --batch-size 1 \
+  --function-response-types ReportBatchItemFailures \
+  --scaling-config MaximumConcurrency=5 \
+  --region $AWS_REGION
+```
+
+- `--batch-size 1` gives each document its own invocation, with the full 15 minutes
+  to itself.
+- `ReportBatchItemFailures` is **required**. The handler signals failures through
+  `batchItemFailures` and doesn't raise.
+- `MaximumConcurrency` limits how many documents are OCR'd in parallel. That bounds
+  the cost and the load on Supabase and the backend. The minimum allowed value is 2.
+
+The S3 bucket → SQS notification is the same one the polling worker uses (see
+[SQS worker](#sqs-worker)). Run the polling worker or the Lambda against a queue,
+not both.
 
 ## Deployment notes (AWS ECS / Fargate)
 

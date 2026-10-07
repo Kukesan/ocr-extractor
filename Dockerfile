@@ -1,10 +1,10 @@
+# syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
 WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
     PATH="/home/appuser/.local/bin:$PATH"
 
 RUN apt-get update && \
@@ -16,14 +16,18 @@ RUN apt-get update && \
 
 COPY requirements.txt .
 
-# Install CPU-only PyTorch first
-RUN pip install --no-cache-dir \
-    torch torchvision \
-    --index-url https://download.pytorch.org/whl/cpu
+COPY --from=ghcr.io/astral-sh/uv:0.12 /uv /usr/local/bin/uv
 
-# Install application dependencies
-RUN pip install --no-cache-dir \
-    -r requirements.txt
+# Install CPU-only PyTorch and the application dependencies in one uv
+# resolve. unsafe-best-match lets torch/torchvision pick the "+cpu" builds
+# from the PyTorch index (they sort above the CUDA builds on PyPI), so no
+# nvidia-* packages are pulled in. The uv cache lives in a BuildKit cache
+# mount: reused across builds, never part of the image.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    UV_LINK_MODE=copy uv pip install --system \
+    -r requirements.txt torch torchvision \
+    --extra-index-url https://download.pytorch.org/whl/cpu \
+    --index-strategy unsafe-best-match
 
 COPY app ./app
 
